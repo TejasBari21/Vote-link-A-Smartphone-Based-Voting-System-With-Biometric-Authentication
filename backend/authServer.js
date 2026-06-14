@@ -5,10 +5,63 @@ const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 const sessionService = require('./services/sessionService');
 const smsOTPService = require('./services/smsOTPService');
+const emailService = require('./services/emailService');
 const connectDB = require('./config/database');
 const { User, Session, AuditLog, Vote } = require('./models');
+const blockchainVoteService = require('./services/blockchainVoteService');
 
 const app = express();
+
+// ── Blockchain reconciliation ─────────────────────────────────────────────
+// Marks legacy votes (recorded before blockchain was mandatory) as confirmed
+// if they were already recorded on the blockchain but missing the hash.
+// New votes always require blockchain — this handles only old data.
+async function confirmPendingBlockchainVotes() {
+  try {
+    const pendingVotes = await Vote.find({
+      $or: [{ blockchainTxHash: null }, { blockchainConfirmed: false }]
+    }).limit(50);
+
+    if (pendingVotes.length === 0) {
+      console.log('✅ No pending blockchain votes to confirm');
+      return { confirmed: 0, failed: 0, total: 0 };
+    }
+
+    console.log(`🔗 Blockchain reconciliation: ${pendingVotes.length} pending vote(s) found`);
+    let confirmed = 0;
+    let failed = 0;
+
+    for (const vote of pendingVotes) {
+      try {
+        // Check if this voter already exists on blockchain (from a partial success)
+        const { ethers } = require('ethers');
+        const voterHash = ethers.keccak256(ethers.toUtf8Bytes(vote.voterID));
+        const { contract } = await blockchainVoteService._getContract();
+        const alreadyVoted = await contract.hasVotedCheck(voterHash);
+
+        if (alreadyVoted) {
+          await Vote.findByIdAndUpdate(vote._id, { blockchainConfirmed: true });
+          console.log(`ℹ️  Vote ${vote._id} already on blockchain — marked confirmed`);
+          confirmed++;
+        } else {
+          // Cannot re-record: plaintext candidateId is no longer stored.
+          // These are legacy votes from before blockchain was mandatory.
+          console.warn(`⚠️  Vote ${vote._id} cannot be replayed — legacy vote without blockchain recording`);
+          failed++;
+        }
+      } catch (err) {
+        console.warn(`⚠️  Could not confirm vote ${vote._id}:`, err.message);
+        failed++;
+      }
+    }
+
+    console.log(`📊 Reconciliation complete — confirmed: ${confirmed}, failed: ${failed}`);
+    return { confirmed, failed, total: pendingVotes.length };
+  } catch (err) {
+    console.error('❌ Blockchain reconciliation error:', err.message);
+    return { confirmed: 0, failed: 0, total: 0, error: err.message };
+  }
+}
 
 // Connect to MongoDB
 connectDB();
@@ -61,7 +114,7 @@ function getClientInfo(req) {
 // Authentication middleware
 function authenticateSession(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
-  
+
   if (!token) {
     return res.status(401).json({
       success: false,
@@ -70,7 +123,7 @@ function authenticateSession(req, res, next) {
   }
 
   const session = sessionService.validateSession(token);
-  
+
   if (!session) {
     return res.status(401).json({
       success: false,
@@ -82,7 +135,101 @@ function authenticateSession(req, res, next) {
   next();
 }
 
+// Admin authentication middleware
+// Checks the X-Admin-Token header against ADMIN_SECRET_TOKEN env var
+function authenticateAdmin(req, res, next) {
+  const adminToken = req.headers['x-admin-token'];
+  const expectedToken = process.env.ADMIN_SECRET_TOKEN;
+
+  if (!expectedToken) {
+    console.error('⚠️ ADMIN_SECRET_TOKEN is not set in environment variables!');
+    return res.status(503).json({
+      success: false,
+      error: 'Admin authentication is not configured on the server.'
+    });
+  }
+
+  if (!adminToken || adminToken !== expectedToken) {
+    console.warn(`🚫 Unauthorized admin access attempt from IP: ${req.ip}`);
+    return res.status(403).json({
+      success: false,
+      error: 'Forbidden: Invalid or missing admin credentials.'
+    });
+  }
+
+  next();
+}
+
 // Routes
+
+/**
+ * Admin Login endpoint — validates credentials and returns admin token
+ * POST /api/auth/admin-login
+ */
+const adminLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { success: false, error: 'Too many admin login attempts. Please try again later.' }
+});
+
+app.post('/api/auth/admin-login', adminLoginLimiter, async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ success: false, error: 'Email and password are required.' });
+    }
+
+    const allowedAdmins = ['admin', 'demo-admin', (process.env.ADMIN_EMAIL || '').toLowerCase()].filter(Boolean);
+    const expectedPassword = process.env.ADMIN_PASSWORD;
+    const adminToken = process.env.ADMIN_SECRET_TOKEN;
+
+    if (!expectedPassword || !adminToken) {
+      console.error('⚠️ ADMIN_PASSWORD or ADMIN_SECRET_TOKEN not set in environment!');
+      return res.status(503).json({ success: false, error: 'Admin authentication is not configured on the server.' });
+    }
+
+    if (!allowedAdmins.includes(email.toLowerCase()) || password !== expectedPassword) {
+      console.warn(`🚫 Failed admin login attempt for: ${email} from IP: ${req.ip}`);
+
+      try {
+        await AuditLog.create({
+          action: 'admin_login_failed',
+          userEmail: email.toLowerCase(),
+          status: 'failure',
+          details: { reason: 'Invalid credentials', ip: req.ip },
+          ipAddress: req.ip || '',
+          deviceInfo: req.get('User-Agent') || ''
+        });
+      } catch (_) { /* non-critical */ }
+
+      return res.status(401).json({ success: false, error: 'Invalid admin credentials.' });
+    }
+
+    console.log(`✅ Admin login successful for: ${email} from IP: ${req.ip}`);
+
+    try {
+      await AuditLog.create({
+        action: 'admin_login_success',
+        userEmail: email.toLowerCase(),
+        status: 'success',
+        details: { ip: req.ip },
+        ipAddress: req.ip || '',
+        deviceInfo: req.get('User-Agent') || ''
+      });
+    } catch (_) { /* non-critical */ }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Admin login successful.',
+      data: { adminToken, email: email.toLowerCase() }
+    });
+
+  } catch (error) {
+    console.error('Admin login error:', error);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
 
 /**
  * Login endpoint - Creates new session if user doesn't have active one
@@ -113,7 +260,7 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
     const cleanMobile = mobile.replace(/\D/g, '');
     const mobileRegex = /^[6-9]\d{9}$/; // Indian format: 10 digits starting with 6-9
     const internationalRegex = /^\d{10,15}$/; // International: 10-15 digits
-    
+
     if (!mobileRegex.test(cleanMobile) && !internationalRegex.test(cleanMobile)) {
       return res.status(400).json({
         success: false,
@@ -131,10 +278,10 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
     let votedElections = [];
     try {
       // Get all elections this user has voted in
-      const existingVotes = await Vote.find({ 
-        userEmail: normalizedEmail 
+      const existingVotes = await Vote.find({
+        userEmail: normalizedEmail
       }).select('electionId votedAt');
-      
+
       if (existingVotes.length > 0) {
         votedElections = existingVotes.map(v => ({
           electionId: v.electionId,
@@ -165,10 +312,10 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
     // ============================================
     try {
       const userWithBreach = await User.findOne({ email: normalizedEmail });
-      
+
       if (userWithBreach && userWithBreach.securityBreach && userWithBreach.securityBreach.detected) {
         console.log(`🔒 Security breach detected for user: ${normalizedEmail}`);
-        
+
         // Log the security breach attempt
         await AuditLog.create({
           action: 'security_breach',
@@ -200,7 +347,7 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
     // Check for existing active session
     if (sessionService.hasActiveSession(normalizedEmail)) {
       const existingSession = sessionService.getSessionInfo(normalizedEmail);
-      
+
       return res.status(409).json({
         success: false,
         error: 'User already logged in',
@@ -219,11 +366,15 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
       await User.findOneAndUpdate(
         { email: normalizedEmail },
         {
-          email: normalizedEmail,
-          mobile: cleanMobile,
-          lastLogin: new Date(),
-          ipAddress,
-          deviceInfo: userAgent
+          $set: {
+            email: normalizedEmail,
+            mobile: cleanMobile,
+            lastLogin: new Date(),
+            ipAddress,
+            deviceInfo: userAgent,
+            isVerified: true,
+            isEmailVerified: true
+          }
         },
         { upsert: true, new: true }
       );
@@ -231,13 +382,13 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
     } catch (dbError) {
       console.warn('⚠️ Failed to save user in database:', dbError.message);
     }
-    
+
     // Create new session
     const session = sessionService.createSession(normalizedEmail, userAgent, ipAddress);
 
     // Fetch latest user data including voting status
     const userData = await User.findOne({ email: normalizedEmail });
-    
+
     // Return success response with voting status and voted elections
     res.status(200).json({
       success: true,
@@ -296,11 +447,11 @@ app.post('/api/auth/check-pairing', async (req, res) => {
     const cleanMobile = mobile.replace(/\D/g, '');
 
     // Check if this mobile is already used with a different email
-    const existingUserWithMobile = await User.findOne({ 
-      mobile: cleanMobile, 
-      email: { $ne: normalizedEmail } 
+    const existingUserWithMobile = await User.findOne({
+      mobile: cleanMobile,
+      email: { $ne: normalizedEmail }
     });
-    
+
     if (existingUserWithMobile) {
       console.log(`⚠️ Pairing check failed: Mobile ${cleanMobile.replace(/(\d{3})\d{4}(\d{3})/, '$1****$2')} already linked to another email`);
       return res.status(403).json({
@@ -312,7 +463,7 @@ app.post('/api/auth/check-pairing', async (req, res) => {
 
     // Check if this email is already used with a different mobile
     const existingUserWithEmail = await User.findOne({ email: normalizedEmail });
-    
+
     if (existingUserWithEmail && existingUserWithEmail.mobile && existingUserWithEmail.mobile !== cleanMobile) {
       console.log(`⚠️ Pairing check failed: Email ${normalizedEmail} already linked to different mobile`);
       return res.status(403).json({
@@ -339,8 +490,10 @@ app.post('/api/auth/check-pairing', async (req, res) => {
 });
 
 /**
- * Request OTP endpoint - Generates and sends OTP via Fast2SMS
- * Called by frontend during login to get OTP for user's mobile number
+ * Request OTP endpoint - Generates and sends OTP via Fast2SMS (SMS)
+ * NOTE: This route is NOT called by the current login flow.
+ * The frontend uses /api/auth/send-email-otp (Gmail SMTP) for OTP.
+ * This endpoint is retained as an optional SMS backup/alternative.
  */
 app.post('/api/auth/request-otp', loginLimiter, async (req, res) => {
   try {
@@ -366,7 +519,7 @@ app.post('/api/auth/request-otp', loginLimiter, async (req, res) => {
     // Validate mobile number
     const cleanMobile = mobile.replace(/\D/g, '');
     const mobileRegex = /^[6-9]\d{9}$/;
-    
+
     if (!mobileRegex.test(cleanMobile)) {
       return res.status(400).json({
         success: false,
@@ -380,16 +533,16 @@ app.post('/api/auth/request-otp', loginLimiter, async (req, res) => {
     // SECURITY CHECK: Validate email-mobile pairing
     // No registration needed - but once a pair is set, it must match
     // ============================================
-    
+
     // Check if this mobile is already used with a different email
-    const existingUserWithMobile = await User.findOne({ 
-      mobile: cleanMobile, 
-      email: { $ne: normalizedEmail } 
+    const existingUserWithMobile = await User.findOne({
+      mobile: cleanMobile,
+      email: { $ne: normalizedEmail }
     });
-    
+
     if (existingUserWithMobile) {
       console.log(`⚠️ Login blocked: Mobile ${cleanMobile.replace(/(\d{3})\d{4}(\d{3})/, '$1****$2')} already linked to another email`);
-      
+
       await AuditLog.create({
         action: 'login_blocked',
         userEmail: normalizedEmail,
@@ -412,10 +565,10 @@ app.post('/api/auth/request-otp', loginLimiter, async (req, res) => {
 
     // Check if this email is already used with a different mobile
     const existingUserWithEmail = await User.findOne({ email: normalizedEmail });
-    
+
     if (existingUserWithEmail && existingUserWithEmail.mobile && existingUserWithEmail.mobile !== cleanMobile) {
       console.log(`⚠️ Login blocked: Email ${normalizedEmail} already linked to different mobile`);
-      
+
       await AuditLog.create({
         action: 'login_blocked',
         userEmail: normalizedEmail,
@@ -535,7 +688,7 @@ app.post('/api/auth/register', loginLimiter, async (req, res) => {
     // Validate mobile number
     const cleanMobile = mobile.replace(/\D/g, '');
     const mobileRegex = /^[6-9]\d{9}$/;
-    
+
     if (!mobileRegex.test(cleanMobile)) {
       return res.status(400).json({
         success: false,
@@ -546,7 +699,7 @@ app.post('/api/auth/register', loginLimiter, async (req, res) => {
     // Validate voterID format (assuming Indian voter ID format: 3 letters + 7 digits)
     const voterIDRegex = /^[A-Z]{3}\d{7}$/i;
     const cleanVoterID = voterID.toUpperCase().trim();
-    
+
     if (!voterIDRegex.test(cleanVoterID)) {
       return res.status(400).json({
         success: false,
@@ -709,7 +862,7 @@ app.post('/api/auth/logout', authenticateSession, (req, res) => {
 app.get('/api/auth/session', authenticateSession, (req, res) => {
   try {
     const sessionInfo = sessionService.getSessionInfo(req.user.email);
-    
+
     if (!sessionInfo) {
       return res.status(401).json({
         success: false,
@@ -776,11 +929,10 @@ app.post('/api/auth/force-logout', (req, res) => {
 /**
  * Admin endpoint - Get all active sessions
  */
-app.get('/api/admin/active-sessions', (req, res) => {
+app.get('/api/admin/active-sessions', authenticateAdmin, (req, res) => {
   try {
-    // In a real application, you would check admin authentication here
     const activeSessions = sessionService.getAllActiveSessions();
-    
+
     res.status(200).json({
       success: true,
       data: {
@@ -800,11 +952,10 @@ app.get('/api/admin/active-sessions', (req, res) => {
 /**
  * Admin endpoint - Force logout all users
  */
-app.post('/api/admin/force-logout-all', (req, res) => {
+app.post('/api/admin/force-logout-all', authenticateAdmin, (req, res) => {
   try {
-    // In a real application, you would check admin authentication here
     sessionService.forceLogoutAll();
-    
+
     res.status(200).json({
       success: true,
       message: 'All user sessions terminated'
@@ -822,11 +973,11 @@ app.post('/api/admin/force-logout-all', (req, res) => {
  * Admin endpoint - Get security metrics
  * Returns real-time security statistics from the database
  */
-app.get('/api/admin/security/metrics', async (req, res) => {
+app.get('/api/admin/security/metrics', authenticateAdmin, async (req, res) => {
   try {
     const securityService = require('./services/securityService');
     const metrics = await securityService.getSecurityMetrics();
-    
+
     res.status(200).json({
       success: true,
       data: metrics
@@ -844,12 +995,12 @@ app.get('/api/admin/security/metrics', async (req, res) => {
  * Admin endpoint - Get security events
  * Returns recent security events from audit logs
  */
-app.get('/api/admin/security/events', async (req, res) => {
+app.get('/api/admin/security/events', authenticateAdmin, async (req, res) => {
   try {
     const { limit = 50, severity } = req.query;
     const securityService = require('./services/securityService');
     const events = await securityService.getSecurityEvents(parseInt(limit), severity);
-    
+
     res.status(200).json({
       success: true,
       data: events
@@ -871,7 +1022,7 @@ app.get('/api/admin/security/events', async (req, res) => {
  * Admin endpoint - Flag user account as security breach
  * Permanently blocks a user from online voting
  */
-app.post('/api/admin/security/flag-breach', async (req, res) => {
+app.post('/api/admin/security/flag-breach', authenticateAdmin, async (req, res) => {
   try {
     const { email, reason, details } = req.body;
 
@@ -918,7 +1069,7 @@ app.post('/api/admin/security/flag-breach', async (req, res) => {
 /**
  * Admin endpoint - Get security breach status for user
  */
-app.get('/api/admin/security/status/:email', async (req, res) => {
+app.get('/api/admin/security/status/:email', authenticateAdmin, async (req, res) => {
   try {
     const { email } = req.params;
 
@@ -953,7 +1104,7 @@ app.get('/api/admin/security/status/:email', async (req, res) => {
 /**
  * Admin endpoint - Clear security breach flag (restore access)
  */
-app.post('/api/admin/security/clear-breach', async (req, res) => {
+app.post('/api/admin/security/clear-breach', authenticateAdmin, async (req, res) => {
   try {
     const { email, reason } = req.body;
 
@@ -997,7 +1148,7 @@ app.post('/api/admin/security/clear-breach', async (req, res) => {
 /**
  * Admin endpoint - Get all breached accounts
  */
-app.get('/api/admin/security/breached-accounts', async (req, res) => {
+app.get('/api/admin/security/breached-accounts', authenticateAdmin, async (req, res) => {
   try {
     const breachedUsers = await User.find(
       { 'securityBreach.detected': true },
@@ -1035,7 +1186,7 @@ app.get('/api/admin/security/breached-accounts', async (req, res) => {
 /**
  * Admin endpoint - Detect security threats for a login attempt
  */
-app.post('/api/admin/security/detect-threats', async (req, res) => {
+app.post('/api/admin/security/detect-threats', authenticateAdmin, async (req, res) => {
   try {
     const { email, ipAddress, userAgent, attemptCount } = req.body;
 
@@ -1076,7 +1227,7 @@ app.post('/api/admin/security/detect-threats', async (req, res) => {
  * IMPORTANT: Only use this for testing/admin purposes in non-production
  * Deletes the vote record and resets hasVoted flag
  */
-app.post('/api/admin/reset-voting-status', async (req, res) => {
+app.post('/api/admin/reset-voting-status', authenticateAdmin, async (req, res) => {
   try {
     const { email, mobile, voterID } = req.body;
 
@@ -1160,10 +1311,10 @@ app.post('/api/admin/reset-voting-status', async (req, res) => {
  * Removes hasVoted flag from users who don't have actual vote records
  * This fixes the issue where users are blocked from voting due to data inconsistency
  */
-app.post('/api/admin/cleanup-voting-data', async (req, res) => {
+app.post('/api/admin/cleanup-voting-data', authenticateAdmin, async (req, res) => {
   try {
     console.log('🧹 Starting voting data consistency cleanup...');
-    
+
     // Get all users marked as hasVoted
     const usersWithVoted = await User.find({ hasVoted: true });
     console.log(`Found ${usersWithVoted.length} users marked as hasVoted`);
@@ -1183,7 +1334,7 @@ app.post('/api/admin/cleanup-voting-data', async (req, res) => {
       // If no actual vote record exists, this is a data inconsistency - fix it
       if (!actualVote) {
         console.warn(`⚠️ Found inconsistency: User ${user.email} (${user.voterID}) marked as hasVoted but no vote record exists. Fixing...`);
-        
+
         await User.updateOne(
           { _id: user._id },
           {
@@ -1256,10 +1407,10 @@ app.get('/api/admin/voting-status/:email', async (req, res) => {
 
     // Check User collection
     const user = await User.findOne({ email: normalizedEmail });
-    
-    // Get ALL votes for this user (for per-election tracking)
-    const votes = await Vote.find({ userEmail: normalizedEmail }).select('electionId votedAt candidateName partyName blockchainConfirmed');
-    
+
+    // Get ALL votes for this user (for per-election tracking) — no candidate data exposed
+    const votes = await Vote.find({ userEmail: normalizedEmail }).select('electionId votedAt blockchainTxHash blockchainConfirmed blockchainBlockNumber');
+
     // Build votedElections array
     const votedElections = votes.map(v => ({
       electionId: v.electionId,
@@ -1301,9 +1452,8 @@ app.get('/api/admin/voting-status/:email', async (req, res) => {
         } : null,
         vote: vote ? {
           id: vote._id,
-          candidateName: vote.candidateName,
-          partyName: vote.partyName,
           votedAt: vote.votedAt || vote.createdAt,
+          blockchainTxHash: vote.blockchainTxHash,
           blockchainConfirmed: vote.blockchainConfirmed
         } : null
       }
@@ -1354,7 +1504,7 @@ app.post('/api/auth/send-otp', loginLimiter, async (req, res) => {
     const cleanMobile = mobile.replace(/\D/g, '');
     const mobileRegex = /^[6-9]\d{9}$/;
     const internationalRegex = /^\d{10,15}$/;
-    
+
     if (!mobileRegex.test(cleanMobile) && !internationalRegex.test(cleanMobile)) {
       return res.status(400).json({
         success: false,
@@ -1367,14 +1517,14 @@ app.post('/api/auth/send-otp', loginLimiter, async (req, res) => {
     // ============================================
     // TRACK VOTED ELECTIONS - ALLOW LOGIN, RESTRICT VOTING PER-ELECTION
     // ============================================
-    
+
     // Check voted elections for informational purposes only (don't block login)
     let votedElections = [];
     try {
-      const existingVotes = await Vote.find({ 
-        userEmail: normalizedEmail 
+      const existingVotes = await Vote.find({
+        userEmail: normalizedEmail
       }).select('electionId votedAt');
-      
+
       if (existingVotes.length > 0) {
         votedElections = existingVotes.map(v => ({
           electionId: v.electionId,
@@ -1400,7 +1550,7 @@ app.post('/api/auth/send-otp', loginLimiter, async (req, res) => {
     // ============================================
     // GENERATE AND SEND REAL SMS OTP
     // ============================================
-    
+
     try {
       const otpResult = await smsOTPService.generateAndSendOTP(normalizedEmail, cleanMobile);
 
@@ -1522,16 +1672,16 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     // ============================================
     // SECURITY CHECK: Validate unique email-mobile mapping
     // ============================================
-    
+
     // Check if mobile is already registered to a different email
-    const existingUserWithMobile = await User.findOne({ 
-      mobile: cleanMobile, 
-      email: { $ne: normalizedEmail } 
+    const existingUserWithMobile = await User.findOne({
+      mobile: cleanMobile,
+      email: { $ne: normalizedEmail }
     });
-    
+
     if (existingUserWithMobile) {
       console.log(`⚠️ Security: Mobile ${cleanMobile.replace(/(\d{3})\d{4}(\d{3})/, '$1****$2')} already registered to another account`);
-      
+
       await AuditLog.create({
         action: 'registration_blocked',
         userEmail: normalizedEmail,
@@ -1555,10 +1705,10 @@ app.post('/api/auth/verify-otp', async (req, res) => {
 
     // Check if email already exists with a different mobile (prevent mobile change)
     const existingUserWithEmail = await User.findOne({ email: normalizedEmail });
-    
+
     if (existingUserWithEmail && existingUserWithEmail.mobile && existingUserWithEmail.mobile !== cleanMobile) {
       console.log(`⚠️ Security: Email ${normalizedEmail} attempting to use different mobile number`);
-      
+
       await AuditLog.create({
         action: 'registration_blocked',
         userEmail: normalizedEmail,
@@ -1589,16 +1739,19 @@ app.post('/api/auth/verify-otp', async (req, res) => {
       const user = await User.findOneAndUpdate(
         { email: normalizedEmail },
         {
-          email: normalizedEmail,
-          mobile: cleanMobile,
-          lastLogin: new Date(),
-          ipAddress,
-          deviceInfo: userAgent,
-          isVerified: true
+          $set: {
+            email: normalizedEmail,
+            mobile: cleanMobile,
+            lastLogin: new Date(),
+            ipAddress,
+            deviceInfo: userAgent,
+            isVerified: true,
+            isEmailVerified: true
+          }
         },
         { upsert: true, new: true }
       );
-      
+
       console.log(`✅ User ${normalizedEmail} saved/updated in database (ID: ${user._id})`);
 
       // Get voted elections for this user
@@ -1673,10 +1826,7 @@ app.post('/api/auth/verify-otp', async (req, res) => {
 // End OTP Routes
 // ==========================================
 
-// ==========================================
-// EMAIL OTP ROUTES (BREVO SMTP)
-// ==========================================
-const emailService = require('./services/emailService');
+// emailService already required at top of file
 
 /**
  * Send Email OTP
@@ -1851,7 +2001,7 @@ app.get('/api/auth/debug-user', userController.debugCheckUser);
  * Admin endpoint - Get OTP store statistics
  * Shows pending OTPs and their status
  */
-app.get('/api/admin/otp/stats', (req, res) => {
+app.get('/api/admin/otp/stats', authenticateAdmin, (req, res) => {
   try {
     const stats = smsOTPService.getOTPStoreStats();
     res.status(200).json({
@@ -1877,10 +2027,10 @@ app.get('/api/admin/otp/stats', (req, res) => {
 /**
  * Admin endpoint - Check OTP status for specific user
  */
-app.get('/api/admin/otp/status/:email/:mobile', (req, res) => {
+app.get('/api/admin/otp/status/:email/:mobile', authenticateAdmin, (req, res) => {
   try {
     const { email, mobile } = req.params;
-    
+
     if (!email || !mobile) {
       return res.status(400).json({
         success: false,
@@ -1919,7 +2069,7 @@ app.get('/api/admin/otp/status/:email/:mobile', (req, res) => {
 /**
  * Admin endpoint - Clear OTP for user (emergency bypass)
  */
-app.post('/api/admin/otp/clear', (req, res) => {
+app.post('/api/admin/otp/clear', authenticateAdmin, (req, res) => {
   try {
     const { email, mobile } = req.body;
 
@@ -1934,8 +2084,8 @@ app.post('/api/admin/otp/clear', (req, res) => {
 
     res.status(200).json({
       success: true,
-      message: cleared 
-        ? 'OTP cleared successfully' 
+      message: cleared
+        ? 'OTP cleared successfully'
         : 'No pending OTP found for this user',
       data: { cleared }
     });
@@ -1952,7 +2102,7 @@ app.post('/api/admin/otp/clear', (req, res) => {
  * Admin endpoint - Cleanup expired OTPs
  * Call this periodically to free up memory
  */
-app.post('/api/admin/otp/cleanup', (req, res) => {
+app.post('/api/admin/otp/cleanup', authenticateAdmin, (req, res) => {
   try {
     const cleanedCount = smsOTPService.cleanupExpiredOTPs();
     res.status(200).json({
@@ -1981,7 +2131,7 @@ const { Election } = require('./models');
  * CREATE NEW ELECTION (Admin only)
  * POST /api/elections
  */
-app.post('/api/elections', async (req, res) => {
+app.post('/api/elections', authenticateAdmin, async (req, res) => {
   try {
     const {
       title,
@@ -2103,7 +2253,7 @@ app.get('/api/elections/active', async (req, res) => {
     // Query for ACTIVE and COMPLETED elections
     const elections = await Election.find({
       $or: [
-        { 
+        {
           $and: [
             { status: 'active' },
             { startDate: { $lte: now } },
@@ -2218,7 +2368,8 @@ app.get('/api/elections/:id', async (req, res) => {
 
     res.status(200).json({
       success: true,
-      data: election
+      data: election,
+      serverTime: new Date().toISOString()
     });
   } catch (error) {
     console.error('Get election error:', error);
@@ -2330,6 +2481,138 @@ app.use((error, req, res, next) => {
   });
 });
 
+// ── Admin: manually trigger blockchain reconciliation ────────────────────
+app.post('/api/admin/blockchain/confirm-votes', async (req, res) => {
+  try {
+    const result = await confirmPendingBlockchainVotes();
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Admin: get count of unconfirmed blockchain votes ─────────────────────
+app.get('/api/admin/blockchain/pending-votes', async (req, res) => {
+  try {
+    const count = await Vote.countDocuments({
+      $or: [{ blockchainTxHash: null }, { blockchainConfirmed: false }]
+    });
+    res.json({ success: true, pendingCount: count });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Blockchain transaction explorer ──────────────────────────────────────
+// Returns blockchain-confirmed votes with transaction details.
+// No candidate/party data is exposed — only blockchain metadata.
+app.get('/api/blockchain/transactions', async (req, res) => {
+  try {
+    const { page = 1, limit = 20, electionId } = req.query;
+    const pageNum = Math.max(1, parseInt(page));
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit)));
+
+    const filter = { blockchainConfirmed: true, blockchainTxHash: { $ne: null } };
+    if (electionId) filter.electionId = electionId;
+
+    const total = await Vote.countDocuments(filter);
+    const votes = await Vote.find(filter)
+      .sort({ votedAt: -1 })
+      .skip((pageNum - 1) * limitNum)
+      .limit(limitNum)
+      .select('blockchainTxHash blockchainBlockNumber blockchainConfirmed electionId region.constituency votedAt');
+
+    res.json({
+      success: true,
+      transactions: votes.map(v => ({
+        txHash: v.blockchainTxHash,
+        blockNumber: v.blockchainBlockNumber,
+        confirmed: v.blockchainConfirmed,
+        electionId: v.electionId,
+        constituency: v.region?.constituency,
+        timestamp: v.votedAt
+      })),
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total,
+        totalPages: Math.ceil(total / limitNum)
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Blockchain live stats from smart contract ────────────────────────────
+// Queries the blockchain directly for election info and vote counts.
+app.get('/api/blockchain/stats', async (req, res) => {
+  try {
+    const { contract } = await blockchainVoteService._getContract();
+    const info = await contract.electionInfo();
+
+    res.json({
+      success: true,
+      blockchain: {
+        contractAddress: process.env.BLOCKCHAIN_CONTRACT_ADDRESS || '0x5FbDB2315678afecb367f032d93F642f64180aa3',
+        network: 'Hardhat Local (chainId 1337)',
+        rpcUrl: process.env.BLOCKCHAIN_RPC || 'http://127.0.0.1:8545',
+        election: {
+          active: info.active,
+          startTime: new Date(Number(info.startTime) * 1000).toISOString(),
+          endTime: new Date(Number(info.endTime) * 1000).toISOString(),
+          totalVotesOnChain: Number(info.totalVotes)
+        }
+      }
+    });
+  } catch (err) {
+    res.status(503).json({
+      success: false,
+      error: 'Blockchain node is not reachable',
+      details: err.message
+    });
+  }
+});
+
+// ── Verify a specific transaction on blockchain ──────────────────────────
+app.get('/api/blockchain/verify/:txHash', async (req, res) => {
+  try {
+    const { txHash } = req.params;
+    if (!txHash || !txHash.startsWith('0x')) {
+      return res.status(400).json({ success: false, error: 'Invalid transaction hash' });
+    }
+
+    const { ethers } = require('ethers');
+    const provider = new ethers.JsonRpcProvider(process.env.BLOCKCHAIN_RPC || 'http://127.0.0.1:8545');
+
+    const tx = await provider.getTransaction(txHash);
+    if (!tx) {
+      return res.status(404).json({ success: false, error: 'Transaction not found on blockchain' });
+    }
+
+    const receipt = await provider.getTransactionReceipt(txHash);
+
+    res.json({
+      success: true,
+      transaction: {
+        hash: tx.hash,
+        blockNumber: receipt?.blockNumber,
+        from: tx.from,
+        to: tx.to,
+        status: receipt?.status === 1 ? 'success' : 'failed',
+        gasUsed: receipt?.gasUsed?.toString(),
+        timestamp: tx.blockNumber ? new Date((await provider.getBlock(tx.blockNumber)).timestamp * 1000).toISOString() : null
+      }
+    });
+  } catch (err) {
+    res.status(503).json({
+      success: false,
+      error: 'Could not verify transaction',
+      details: err.message
+    });
+  }
+});
+
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({
@@ -2343,7 +2626,13 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Authentication server running on port ${PORT}`);
   console.log(`📡 Accessible from network at: http://10.224.94.165:${PORT}`);
-  
+
+  // Attempt to confirm any votes that were recorded without a blockchain hash.
+  // Runs once 15 seconds after startup (giving the Hardhat node time to be ready)
+  // and then every 5 minutes thereafter.
+  setTimeout(() => confirmPendingBlockchainVotes().catch(() => {}), 15000);
+  setInterval(() => confirmPendingBlockchainVotes().catch(() => {}), 5 * 60 * 1000);
+
   // Check Fast2SMS configuration
   try {
     require('./services/smsOTPService').validateFast2SMSConfig();
@@ -2352,7 +2641,7 @@ app.listen(PORT, '0.0.0.0', () => {
     console.error(`❌ ${error.message}`);
     console.error(`   Set FAST2SMS_API_KEY environment variable to enable SMS OTP`);
   }
-  
+
   console.log(`\n📋 Available endpoints:`);
   console.log(`   POST /api/auth/register - Voter registration (with duplicate prevention)`);
   console.log(`   POST /api/auth/login - User login`);

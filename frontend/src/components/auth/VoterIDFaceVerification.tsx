@@ -86,18 +86,6 @@ export const VoterIDFaceVerification: React.FC<VoterIDFaceVerificationProps> = (
     }
   };
 
-  const getConfidenceColor = (confidence: number) => {
-    if (confidence >= 80) return 'text-green-600';
-    if (confidence >= 60) return 'text-yellow-600';
-    return 'text-red-600';
-  };
-
-  const getConfidenceBgColor = (confidence: number) => {
-    if (confidence >= 80) return 'bg-green-50 border-green-200';
-    if (confidence >= 60) return 'bg-yellow-50 border-yellow-200';
-    return 'bg-red-50 border-red-200';
-  };
-
   return (
     <div className="min-h-screen flex items-center justify-center p-4 pt-20">
       <div className="bg-white/20 backdrop-blur-xl rounded-3xl shadow-2xl p-6 w-full max-w-xl border border-white/30">
@@ -236,18 +224,6 @@ export const VoterIDFaceVerification: React.FC<VoterIDFaceVerificationProps> = (
                   <h2 className="text-3xl font-bold text-green-600 mb-2">Face Match Verified! ✅</h2>
                   <p className="text-gray-700 text-lg mb-6">{matchResult.message}</p>
 
-                  <div className={`p-6 rounded-2xl border-2 ${getConfidenceBgColor(matchResult.confidence)} mb-6`}>
-                    <div className="flex items-center justify-center gap-3 mb-4">
-                      <div className="text-6xl font-bold ${getConfidenceColor(matchResult.confidence)}">
-                        {matchResult.confidence}%
-                      </div>
-                    </div>
-                    <p className="font-medium text-gray-700">Match Confidence</p>
-                    <p className="text-sm text-gray-600 mt-2">
-                      Distance Score: {matchResult.distance.toFixed(4)}
-                    </p>
-                  </div>
-
                   {voterIDPreview && (
                     <div className="mb-6">
                       <p className="text-sm text-gray-600 mb-3">Verified Voter ID:</p>
@@ -275,18 +251,6 @@ export const VoterIDFaceVerification: React.FC<VoterIDFaceVerificationProps> = (
                   <AlertCircle className="w-20 h-20 text-red-500 mx-auto mb-4" />
                   <h2 className="text-3xl font-bold text-red-600 mb-2">Face Mismatch ❌</h2>
                   <p className="text-gray-700 text-lg mb-6">{matchResult.message}</p>
-
-                  <div className={`p-6 rounded-2xl border-2 ${getConfidenceBgColor(matchResult.confidence)} mb-6`}>
-                    <div className="flex items-center justify-center gap-3 mb-4">
-                      <div className={`text-6xl font-bold ${getConfidenceColor(matchResult.confidence)}`}>
-                        {matchResult.confidence}%
-                      </div>
-                    </div>
-                    <p className="font-medium text-gray-700">Match Confidence</p>
-                    <p className="text-sm text-gray-600 mt-2">
-                      Distance Score: {matchResult.distance.toFixed(4)}
-                    </p>
-                  </div>
 
                   <div className="bg-red-50 border border-red-200 rounded-xl p-4 mb-6">
                     <h3 className="font-semibold text-red-800 mb-2">❌ Verification Failed</h3>

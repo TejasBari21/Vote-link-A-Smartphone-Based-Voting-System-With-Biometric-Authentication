@@ -59,19 +59,6 @@ export const VoterIDVerification: React.FC<VoterIDVerificationProps> = ({
     }
   };
 
-  const getConfidenceColor = (confidence: number) => {
-    if (confidence >= 90) return 'text-green-600';
-    if (confidence >= 70) return 'text-yellow-600';
-    return 'text-red-600';
-  };
-
-  const getConfidenceLabel = (confidence: number) => {
-    if (confidence >= 90) return 'High Confidence';
-    if (confidence >= 70) return 'Medium Confidence';
-    if (confidence >= 50) return 'Low Confidence';
-    return 'Very Low Confidence';
-  };
-
   return (
     <div className="min-h-screen flex items-center justify-center p-4">
       <div className="bg-white/20 backdrop-blur-xl rounded-3xl shadow-2xl p-8 w-full max-w-md border border-white/30">
@@ -210,12 +197,6 @@ export const VoterIDVerification: React.FC<VoterIDVerificationProps> = ({
                     </div>
                   )}
 
-                  <div className="mt-4">
-                    <span className={`inline-flex items-center px-3 py-1 rounded-full text-sm font-medium ${getConfidenceColor(verificationResult.confidence)}`}>
-                      Confidence: {verificationResult.confidence}% - {getConfidenceLabel(verificationResult.confidence)}
-                    </span>
-                  </div>
-
                   <p className="text-sm text-black/60 mt-4">
                     Redirecting to voting interface...
                   </p>
@@ -226,14 +207,6 @@ export const VoterIDVerification: React.FC<VoterIDVerificationProps> = ({
                   <h2 className="text-2xl font-bold text-red-600 mb-2">Verification Failed</h2>
                   <p className="text-black/70 mb-4">{verificationResult?.error}</p>
                   
-                  {verificationResult?.confidence && verificationResult.confidence > 0 && (
-                    <div className="mt-4">
-                      <span className={`inline-flex items-center px-3 py-1 rounded-full text-sm font-medium ${getConfidenceColor(verificationResult.confidence)}`}>
-                        Confidence: {verificationResult.confidence}% - {getConfidenceLabel(verificationResult.confidence)}
-                      </span>
-                    </div>
-                  )}
-
                   <div className="bg-red-50/50 backdrop-blur-sm rounded-xl p-4 mt-4 border border-red-200/50">
                     <h3 className="font-semibold text-red-800 mb-2">What you can do:</h3>
                     <ul className="text-sm text-red-700 text-left space-y-1">

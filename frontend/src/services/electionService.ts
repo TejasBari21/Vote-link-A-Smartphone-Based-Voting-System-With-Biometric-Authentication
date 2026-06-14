@@ -58,6 +58,23 @@ class ElectionService {
   private listeners: Set<(elections: Election[]) => void> = new Set();
   private synced: boolean = false;
 
+  private normalizeRegionValue(value?: string): string {
+    return (value || '').trim().toLowerCase();
+  }
+
+  private isElectionLive(election: Election, now: Date = new Date()): boolean {
+    const startDate = new Date(election.startDate);
+    const endDate = new Date(election.endDate);
+
+    // Keep legacy behavior for malformed dates instead of hiding elections unexpectedly.
+    if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
+      return election.status === 'active';
+    }
+
+    const statusAllowsVoting = election.status === 'active' || election.status === 'scheduled';
+    return statusAllowsVoting && now >= startDate && now <= endDate;
+  }
+
   constructor() {
     this.loadElections();
     this.initializeDefaultElections();
@@ -74,7 +91,7 @@ class ElectionService {
    */
   private async syncFromBackend(): Promise<void> {
     try {
-      const response = await fetch(`${API_BASE_URL}/elections/active`);
+      const response = await fetch(`${API_BASE_URL}/elections`);
       const result = await response.json();
 
       if (result.success && result.data.elections) {
@@ -83,9 +100,9 @@ class ElectionService {
         this.elections.forEach(e => {
           const id = e.id || e._id || '';
           if (e.resultsPublished) {
-            localPublishedStates.set(id, { 
-              published: e.resultsPublished, 
-              publishedAt: e.resultsPublishedAt || null 
+            localPublishedStates.set(id, {
+              published: e.resultsPublished,
+              publishedAt: e.resultsPublishedAt || null
             });
           }
         });
@@ -94,7 +111,7 @@ class ElectionService {
         this.elections = result.data.elections.map((el: any) => {
           const id = el._id || el.id || '';
           const localState = localPublishedStates.get(id);
-          
+
           return {
             id: id,
             ...el,
@@ -110,7 +127,7 @@ class ElectionService {
         this.synced = true;
         this.saveElections(); // Also save to localStorage as backup
         this.notifyListeners();
-        console.log(`✅ Synced ${this.elections.length} active elections from backend`);
+        console.log(`✅ Synced ${this.elections.length} elections from backend`);
         console.log(`📊 Elections with resultsPublished:`, this.elections.filter(e => e.resultsPublished).map(e => e.title));
       }
     } catch (error) {
@@ -145,7 +162,7 @@ class ElectionService {
     // IMPORTANT: No default/demo elections are initialized
     // All elections must be created by the admin and stored in the database
     // If no elections exist, the frontend will show "No active elections available"
-    
+
     // Empty elections array - will be populated only by admin-created elections
     if (this.elections.length === 0) {
       this.elections = [];
@@ -192,7 +209,7 @@ class ElectionService {
     this.listeners.add(listener);
     // Immediately notify with current elections
     listener([...this.elections]);
-    
+
     return () => {
       this.listeners.delete(listener);
     };
@@ -207,26 +224,36 @@ class ElectionService {
   // Get active elections for voters
   getActiveElections(): Election[] {
     this.checkScheduledElections();
-    return this.elections.filter(e => e.status === 'active');
+    const now = new Date();
+    return this.elections.filter(e => this.isElectionLive(e, now));
   }
 
   // Get elections by region
-  getElectionsByRegion(state: string, district?: string): Election[] {
+  getElectionsByRegion(state?: string, district?: string): Election[] {
     this.checkScheduledElections();
+    const targetState = this.normalizeRegionValue(state);
+    const targetDistrict = this.normalizeRegionValue(district);
+
     return this.elections.filter(e => {
-      if (e.status !== 'active') return false;
-      
+      if (!this.isElectionLive(e)) return false;
+
       // National elections are available to everyone
       if (e.type === 'national') return true;
-      
+
+      const electionState = this.normalizeRegionValue(e.region.state);
+      const electionDistrict = this.normalizeRegionValue(e.region.district);
+
+      // If no region is selected yet, show all currently live elections.
+      if (!targetState) return true;
+
       // State elections are available to voters in that state
-      if (e.region.state === state || e.region.state === 'All States') {
-        if (district && e.region.district) {
-          return e.region.district === district;
+      if (electionState === targetState || electionState === 'all states') {
+        if (targetDistrict && electionDistrict) {
+          return electionDistrict === targetDistrict;
         }
         return true;
       }
-      
+
       return false;
     });
   }
@@ -241,10 +268,12 @@ class ElectionService {
    */
   async createElection(electionData: Omit<Election, '_id' | 'id' | 'createdAt' | 'votesCast'>): Promise<Election> {
     try {
+      const adminToken = localStorage.getItem('votelink_admin_token') || '';
       const response = await fetch(`${API_BASE_URL}/elections`, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
+          'X-Admin-Token': adminToken
         },
         body: JSON.stringify({
           ...electionData,
@@ -256,15 +285,21 @@ class ElectionService {
       const result = await response.json();
 
       if (result.success) {
-        const newElection = {
+        const newElection: Election = {
           id: result.data._id,
           ...result.data
         };
 
-        // Add to local list
-        this.elections.push(newElection);
+        const index = this.elections.findIndex(e => e.id === newElection.id || e._id === newElection.id);
+        if (index !== -1) {
+          this.elections[index] = newElection;
+        } else {
+          this.elections.push(newElection);
+        }
+
+        this.saveElections();
         this.notifyListeners();
-        
+
         console.log(`📋 New election created and saved to backend: "${newElection.title}"`);
         return newElection;
       } else {
@@ -282,11 +317,13 @@ class ElectionService {
   async updateElection(id: string, updates: Partial<Election>): Promise<Election | null> {
     try {
       console.log('📝 Updating election:', id, 'with:', updates);
-      
+
+      const adminToken = localStorage.getItem('votelink_admin_token') || '';
       const response = await fetch(`${API_BASE_URL}/elections/${id}`, {
         method: 'PUT',
         headers: {
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
+          'X-Admin-Token': adminToken
         },
         body: JSON.stringify(updates)
       });
@@ -309,7 +346,7 @@ class ElectionService {
           // If not found by id, try to add it
           this.elections.push(updatedElection);
         }
-        
+
         // Save to localStorage as backup
         this.saveElections();
         this.notifyListeners();
@@ -322,7 +359,7 @@ class ElectionService {
       }
     } catch (error) {
       console.error('Error updating election:', error);
-      
+
       // Fallback: Update localStorage only if backend fails
       const index = this.elections.findIndex(e => e.id === id || e._id === id);
       if (index !== -1) {
@@ -332,7 +369,7 @@ class ElectionService {
         console.log('⚠️ Updated localStorage only (backend failed)');
         return this.elections[index];
       }
-      
+
       return null;
     }
   }
@@ -349,33 +386,33 @@ class ElectionService {
   }
 
   // Start an election immediately
-  startElection(id: string): Election | null {
-    return this.updateElection(id, { 
+  startElection(id: string): Promise<Election | null> {
+    return this.updateElection(id, {
       status: 'active',
       startDate: new Date().toISOString()
     });
   }
 
   // Pause an active election
-  pauseElection(id: string): Election | null {
+  pauseElection(id: string): Promise<Election | null> {
     return this.updateElection(id, { status: 'paused' });
   }
 
   // Resume a paused election
-  resumeElection(id: string): Election | null {
+  resumeElection(id: string): Promise<Election | null> {
     return this.updateElection(id, { status: 'active' });
   }
 
   // End an election
-  endElection(id: string): Election | null {
-    return this.updateElection(id, { 
+  endElection(id: string): Promise<Election | null> {
+    return this.updateElection(id, {
       status: 'completed',
       endDate: new Date().toISOString()
     });
   }
 
   // Archive an election
-  archiveElection(id: string): Election | null {
+  archiveElection(id: string): Promise<Election | null> {
     return this.updateElection(id, { status: 'archived' });
   }
 
@@ -399,6 +436,16 @@ class ElectionService {
     return true;
   }
 
+  // Force delete any election regardless of status (admin action)
+  forceDeleteElection(id: string): boolean {
+    const election = this.elections.find(e => e.id === id || e._id === id);
+    if (!election) return false;
+
+    this.elections = this.elections.filter(e => e.id !== id && e._id !== id);
+    this.saveElections();
+    return true;
+  }
+
   // Record a vote
   recordVote(electionId: string, candidateId: string, voterId: string): boolean {
     const election = this.elections.find(e => e.id === electionId);
@@ -407,7 +454,7 @@ class ElectionService {
     // Check if voter already voted in this election
     const votesKey = `${VOTES_STORAGE_KEY}_${electionId}`;
     const votes = JSON.parse(localStorage.getItem(votesKey) || '{}');
-    
+
     if (votes[voterId]) {
       console.log('❌ Voter has already cast a vote in this election');
       return false;
@@ -421,7 +468,7 @@ class ElectionService {
     localStorage.setItem(votesKey, JSON.stringify(votes));
 
     // Update vote count
-    election.votesCast += 1;
+    election.votesCast = (election.votesCast || 0) + 1;
     this.saveElections();
 
     console.log(`✅ Vote recorded for election "${election.title}"`);
@@ -432,7 +479,7 @@ class ElectionService {
   getElectionResults(electionId: string): { candidateId: string; votes: number }[] {
     const votesKey = `${VOTES_STORAGE_KEY}_${electionId}`;
     const votes = JSON.parse(localStorage.getItem(votesKey) || '{}');
-    
+
     const results: Record<string, number> = {};
     Object.values(votes).forEach((vote: any) => {
       results[vote.candidateId] = (results[vote.candidateId] || 0) + 1;
@@ -451,7 +498,7 @@ class ElectionService {
 
     election.candidates = [...election.candidates, ...candidates];
     this.saveElections();
-    
+
     return election;
   }
 
@@ -462,7 +509,7 @@ class ElectionService {
 
     election.candidates = election.candidates.filter(c => c.id !== candidateId);
     this.saveElections();
-    
+
     return election;
   }
 }

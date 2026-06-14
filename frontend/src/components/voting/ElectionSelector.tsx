@@ -76,27 +76,8 @@ export const ElectionSelector: React.FC<ElectionSelectorProps> = ({
   useEffect(() => {
     setIsLoading(true);
     
-    const unsubscribe = electionService.subscribe((updatedElections) => {
-      // Filter elections based on user's region
-      const activeElections = updatedElections.filter(e => {
-        if (e.status !== 'active') return false;
-        
-        // National elections are available to everyone
-        if (e.type === 'national') return true;
-        
-        // Filter by state if provided
-        if (selectedState && e.region.state !== selectedState && e.region.state !== 'All States') {
-          return false;
-        }
-        
-        // Filter by district if provided
-        if (selectedDistrict && e.region.district && e.region.district !== selectedDistrict) {
-          return false;
-        }
-        
-        return true;
-      });
-      
+    const unsubscribe = electionService.subscribe(() => {
+      const activeElections = electionService.getElectionsByRegion(selectedState, selectedDistrict);
       setElections(activeElections);
       setIsLoading(false);
       setLastRefresh(new Date());
@@ -108,17 +89,8 @@ export const ElectionSelector: React.FC<ElectionSelectorProps> = ({
   // Auto-refresh every 30 seconds
   useEffect(() => {
     const interval = setInterval(() => {
-      // Trigger re-subscription to get latest elections
-      const activeElections = electionService.getActiveElections();
-      setElections(activeElections.filter(e => {
-        if (selectedState && e.region.state !== selectedState && e.region.state !== 'All States') {
-          return false;
-        }
-        if (selectedDistrict && e.region.district && e.region.district !== selectedDistrict) {
-          return false;
-        }
-        return true;
-      }));
+      const activeElections = electionService.getElectionsByRegion(selectedState, selectedDistrict);
+      setElections(activeElections);
       setLastRefresh(new Date());
     }, 30000);
 
@@ -199,16 +171,8 @@ export const ElectionSelector: React.FC<ElectionSelectorProps> = ({
 
   const handleRefresh = () => {
     setIsLoading(true);
-    const activeElections = electionService.getActiveElections();
-    setElections(activeElections.filter(e => {
-      if (selectedState && e.region.state !== selectedState && e.region.state !== 'All States') {
-        return false;
-      }
-      if (selectedDistrict && e.region.district && e.region.district !== selectedDistrict) {
-        return false;
-      }
-      return true;
-    }));
+    const activeElections = electionService.getElectionsByRegion(selectedState, selectedDistrict);
+    setElections(activeElections);
     setLastRefresh(new Date());
     setIsLoading(false);
   };
