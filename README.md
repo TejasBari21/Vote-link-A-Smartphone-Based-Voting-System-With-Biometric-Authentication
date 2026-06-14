@@ -334,12 +334,8 @@ bash test_election_system.sh
 
 ---
 
-## 📝 License
+## Author
+**Tejas Bari**
 
-This project is licensed under the **ISC License**.
-
----
-
-<p align="center">
-  Built with ❤️ for secure and accessible democratic elections
-</p>
+## License
+This project is for learning and academic purposes.
